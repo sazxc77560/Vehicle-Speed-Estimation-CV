@@ -57,7 +57,6 @@ class LaneLineSpeedEstimator:
         self.M = cv2.getPerspectiveTransform(self.src_pts, self.dst_pts)
 
     def _preprocess(self, frame):
-        # ... (保持不變) ...
         frame_bev = cv2.warpPerspective(frame, self.M, (self.bev_width, self.bev_height))
         gray = cv2.cvtColor(frame_bev, cv2.COLOR_BGR2GRAY)
         _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
@@ -148,7 +147,6 @@ class LaneLineSpeedEstimator:
             print(f"Frame {self.frame_count}: Speed={self.smooth_speed:.2f} km/h (Smoothed)")
 
     def _draw_results(self, frame, frame_bev, lanes):
-        # ... (保持不變) ...
         if self.smooth_speed > 0:
             text = f"Speed: {self.smooth_speed:.1f} km/h"
             cv2.putText(frame, text, (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 6)
@@ -166,7 +164,6 @@ class LaneLineSpeedEstimator:
         return vis_bev
 
     def run(self):
-        # ... (保持不變) ...
         print(f"開始執行穩定版測速... (FPS={self.fps})")
         while self.cap.isOpened():
             ret, frame = self.cap.read()
