@@ -5,7 +5,7 @@
 
 本專案實作了一套即時的**單目視覺車速估測系統 (Vehicle Speed Estimation System)**。不同於傳統依賴雷達或光達 (Lidar) 的測速方案，本系統利用**電腦視覺 (Computer Vision)** 技術，直接從一般的 2D 監控影片中計算車輛速度。
 
-核心技術採用 **逆透視變換 (Inverse Perspective Mapping, IPM)**，將攝影機的透視視角轉換為**鳥瞰圖 (Bird's-Eye View, BEV)**，藉此消除透視變形，實現精確的物理距離測量與速度計算。
+核心技術採用 **逆透視變換 (Inverse Perspective Mapping, IPM)**，將攝影機的透視視角轉換為**鳥瞰圖 (Bird's-Eye View, BEV)**，藉此消除透視變形，實現物理距離測量與速度計算。
 
 ### 🎯 核心功能 (Key Features)
 * **逆透視變換 (IPM):** 利用透視變換矩陣，將 2D 影像還原為鳥瞰視角，建立線性距離關係。
