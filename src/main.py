@@ -3,227 +3,192 @@ import numpy as np
 import math
 import argparse
 import os
+from collections import deque
 
 
-class VehicleSpeedEstimator:
-    def __init__(self, video_path, output_name="output.mp4"):
-        # ========== 1. 初始化與基本設定 ==========
+class LaneLineSpeedEstimator:
+    def __init__(self, video_path, output_name="output/result_stable.mp4"):
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"找不到影片檔案: {video_path}")
 
         self.cap = cv2.VideoCapture(video_path)
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # FPS 設定
+        file_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if 24.0 < file_fps < 26.0:
+            self.fps = 24.98
+        else:
+            self.fps = file_fps
         self.dt = 1.0 / self.fps
 
-        # 參數設定 (完全依照原本限制條件)
-        self.N = 5  # 移動平均長度
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # 參數設定：增加穩定性
+        self.N = 15  # 平滑窗口加大到 15
         self.speed_history = []
-        self.prev_ref_segments = []
         self.frame_count = 0
-        self.smooth_speed = None
+        self.smooth_speed = 0.0
+
+        # 歷史軌跡佇列 (用來儲存前幾幀的車道線位置)
+        # 格式: deque 裡存 (frame_index, list_of_lanes)
+        self.history_len = 6
+        self.lane_history = deque(maxlen=self.history_len)
+
+        # 全域平均比例尺 (避免比例尺忽大忽小)
+        self.global_avg_height_px = 0.0
+        self.valid_height_counts = 0
+
+        self.REAL_WORLD_LANE_LENGTH = 10.0
 
         # 輸出設定
-        self.out = cv2.VideoWriter(
-            output_name,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            self.fps,
-            (self.frame_width, self.frame_height)
-        )
+        os.makedirs("output", exist_ok=True)
+        self.bev_width = 600
+        self.bev_height = 800
+        self.out = cv2.VideoWriter(output_name, cv2.VideoWriter_fourcc(*"mp4v"), self.fps,
+                                   (self.frame_width, self.frame_height))
+        self.out_binary = cv2.VideoWriter("output/result_binary.mp4", cv2.VideoWriter_fourcc(*"mp4v"), self.fps,
+                                          (self.bev_width, self.bev_height))
 
-        self.binary_width = 600
-        self.binary_height = 300
-        self.out_binary = cv2.VideoWriter(
-            "output_binary.mp4",
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            self.fps,
-            (self.binary_width, self.binary_height)
-        )
-
-        # ========== 2. 透視變換設定 (保留原本座標) ==========
-        self.src_pts = np.float32([
-            [1457, 1129],  # 左上
-            [1700, 1126],  # 右上
-            [1930, 1295],  # 右下
-            [1165, 1286]  # 左下
-        ])
-
-        # 計算變換矩陣 M
-        self.width = int(np.linalg.norm(self.src_pts[0] - self.src_pts[1]))
-        self.height = int(np.linalg.norm(self.src_pts[0] - self.src_pts[3]))
-
-        dst_pts = np.float32([
-            [0, 0],
-            [self.width - 1, 0],
-            [self.width - 1, self.height - 1],
-            [0, self.height - 1]
-        ])
-        self.M = cv2.getPerspectiveTransform(self.src_pts, dst_pts)
+        # 透視變換設定
+        self.src_pts = np.float32([[1457, 1129], [1700, 1126], [1930, 1295], [1165, 1286]])
+        self.dst_pts = np.float32(
+            [[0, 0], [self.bev_width - 1, 0], [self.bev_width - 1, self.bev_height - 1], [0, self.bev_height - 1]])
+        self.M = cv2.getPerspectiveTransform(self.src_pts, self.dst_pts)
 
     def _preprocess(self, frame):
-        """步驟 1-3: 透視變換 + 二值化 + 形態學"""
-        # Step 1: 鳥瞰轉換
-        frame_bird = cv2.warpPerspective(frame, self.M, (self.width, self.height))
+        # ... (保持不變) ...
+        frame_bev = cv2.warpPerspective(frame, self.M, (self.bev_width, self.bev_height))
+        gray = cv2.cvtColor(frame_bev, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 15))
+        binary_clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_v, iterations=1)
+        return frame_bev, binary_clean
 
-        # Step 2: 灰階 + 降噪 + 二值化 (閾值 130)
-        gray = cv2.cvtColor(frame_bird, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, binary = cv2.threshold(blur, 130, 255, cv2.THRESH_BINARY)
-
-        # Step 3: 形態學操作
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        binary_clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-        binary_clean = cv2.morphologyEx(binary_clean, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        return frame_bird, binary_clean
-
-    def _get_segments(self, binary_clean):
-        """步驟 4: 連通元件分析與篩選"""
-        h_img, w_img = binary_clean.shape[:2]
+    def _get_lane_segments(self, binary_clean):
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_clean, connectivity=8)
-
-        ref_segments = []
+        lane_segments = []
         for i in range(1, num_labels):
-            x, y, w_box, h_box, area = stats[i]
+            x, y, w, h, area = stats[i]
             cx, cy = centroids[i]
+            aspect_ratio = h / float(w) if w > 0 else 0
+            if 100 < area < 5000:
+                if aspect_ratio > 1.5:
+                    lane_segments.append({'centroid': (cx, cy), 'bbox': (x, y, w, h), 'height_px': h})
+        return lane_segments
 
-            # 原本的篩選條件
-            if w_box < (w_img * 2 / 5):
-                if y + h_box / 2 > (h_img / 2):
-                    ref_segments.append((x, y, w_box, h_box, cx, cy))
-        return ref_segments
+    def _compute_speed_from_lanes(self, current_lanes):
 
-    def _calculate_scale_from_lines(self, binary_clean, frame_bird):
-        """步驟 5: 霍夫直線變換取得比例尺"""
-        scale_m_per_pixel = None
-        edges = cv2.Canny(binary_clean, 50, 150, apertureSize=3)
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50,
-                                minLineLength=50, maxLineGap=20)
+        # 1. 將現在的車道線存入歷史紀錄
+        self.lane_history.append(current_lanes)
 
-        if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                length = math.hypot(x2 - x1, y2 - y1)
-                angle = abs(math.degrees(math.atan2((y2 - y1), (x2 - x1))))
+        # 2. 如果歷史資料還不夠 (少於 5 幀)，先跳過不計算
+        if len(self.lane_history) < self.history_len:
+            return
 
-                # 原本的角度過濾條件 (80 < angle < 100)
-                if 80 < angle < 100:
-                    cv2.line(frame_bird, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    if length > 0:
-                        scale_m_per_pixel = 10.0 / length
-                    break
-        return scale_m_per_pixel
+        # 3. 取出「現在」與「5 幀前」的資料
+        # history[-1] 是最新, history[0] 是最舊 (5幀前)
+        past_lanes = self.lane_history[0]
+        frame_diff = self.history_len - 1  # 實際間隔幀數
 
-    def _compute_speed(self, ref_segments, scale_m_per_pixel):
-        """步驟 6: 計算速度 (每 2 幀一次)"""
-        if self.frame_count % 2 == 0:
-            for seg in ref_segments:
-                x, y, w_box, h_box, cx, cy = seg
+        frame_speeds = []
 
-                # Fallback scale (依照原本邏輯)
-                current_scale = scale_m_per_pixel
-                if current_scale is None and h_box > 0:
-                    current_scale = 10.0 / h_box
+        for curr in current_lanes:
+            cx, cy = curr['centroid']
+            h_px = curr['height_px']
 
-                best = None
-                best_dist = 1e9
-                for prev in self.prev_ref_segments:
-                    pcx, pcy = prev[4], prev[5]
-                    d = math.hypot(cx - pcx, cy - pcy)
-                    if d < best_dist:
-                        best_dist = d
-                        best = prev
+            # --- [穩定比例尺更新] ---
+            # 使用移動平均更新全域線段高度，避免比例尺亂跳
+            if self.valid_height_counts == 0:
+                self.global_avg_height_px = h_px
+            else:
+                self.global_avg_height_px = 0.95 * self.global_avg_height_px + 0.05 * h_px
+            self.valid_height_counts += 1
 
-                # 原本的判斷條件 (dist < 50)
-                if best is not None and best_dist < 50 and current_scale is not None:
-                    real_dist = best_dist * current_scale
+            # 尋找 5 幀前的對應線段
+            best_match = None
+            min_dist = 1e9
 
-                    # 速度公式: 距離 / 時間 (dt * 2) * 3.6
-                    speed = real_dist / (self.dt * 2) * 3.6
+            for prev in past_lanes:
+                px, py = prev['centroid']
+                dist = math.hypot(cx - px, cy - py)
 
-                    # 原本的過濾範圍 (80 ~ 120)
-                    if 80 <= speed <= 120:
-                        self.speed_history.append(speed)
-                        if len(self.speed_history) > self.N:
-                            self.speed_history.pop(0)
+                # 假設車速很快，5幀可能跑了 200-300 pixel，設寬鬆閾值
+                if dist < 400 and dist < min_dist:
+                    min_dist = dist
+                    best_match = prev
 
-                        self.smooth_speed = sum(self.speed_history) / len(self.speed_history)
-                        print(f"speed (smoothed) = {int(self.smooth_speed)}")
+            if best_match:
+                # 計算 Y 軸位移 (5 幀的總位移)
+                pixel_displacement = abs(cy - best_match['centroid'][1])
 
-        # 更新上一幀的紀錄
-        self.prev_ref_segments = ref_segments
+                # 使用穩定的全域比例尺
+                if self.global_avg_height_px > 0 and pixel_displacement > 0:
+                    scale = self.REAL_WORLD_LANE_LENGTH / self.global_avg_height_px
 
-    def _draw_results(self, frame, frame_bird, ref_segments):
-        """繪製結果與輸出"""
-        # 標註速度
-        if self.smooth_speed is not None:
-            text = f"Speed: {self.smooth_speed:.2f} km/h"
-            cv2.putText(frame, text, (self.frame_width - 450, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                    distance_m = pixel_displacement * scale
 
-        # 標註紅點 (鳥瞰圖)
-        points_frame = frame_bird.copy()
-        for i, seg in enumerate(ref_segments):
-            cx, cy = int(seg[4]), int(seg[5])
-            cv2.circle(points_frame, (cx, cy), 6, (0, 0, 255), -1)
-            cv2.putText(points_frame, str(i), (cx + 10, cy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                    # 時間 = dt * 間隔幀數
+                    time_elapsed = self.dt * frame_diff
 
-        # 顯示畫面
-        frame_out = cv2.resize(frame, (800, 500))
-        cv2.imshow("Output", frame_out)
-        cv2.imshow("Bird View Points", points_frame)
+                    v = (distance_m / time_elapsed) * 3.6
 
-        return points_frame
+                    if 5 < v < 200:
+                        frame_speeds.append(v)
+
+        if frame_speeds:
+            avg_v = sum(frame_speeds) / len(frame_speeds)
+
+            self.speed_history.append(avg_v)
+            if len(self.speed_history) > self.N:
+                self.speed_history.pop(0)
+
+            self.smooth_speed = sum(self.speed_history) / len(self.speed_history)
+
+            print(f"Frame {self.frame_count}: Speed={self.smooth_speed:.2f} km/h (Smoothed)")
+
+    def _draw_results(self, frame, frame_bev, lanes):
+        # ... (保持不變) ...
+        if self.smooth_speed > 0:
+            text = f"Speed: {self.smooth_speed:.1f} km/h"
+            cv2.putText(frame, text, (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 6)
+            cv2.putText(frame, text, (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
+
+        vis_bev = cv2.cvtColor(frame_bev, cv2.COLOR_GRAY2BGR) if len(frame_bev.shape) == 2 else frame_bev.copy()
+        for lane in lanes:
+            x, y, w, h = lane['bbox']
+            cv2.rectangle(vis_bev, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cx, cy = int(lane['centroid'][0]), int(lane['centroid'][1])
+            cv2.circle(vis_bev, (cx, cy), 5, (0, 0, 255), -1)
+
+        cv2.imshow("Original", cv2.resize(frame, (800, 450)))
+        cv2.imshow("Lane Tracking (BEV)", vis_bev)
+        return vis_bev
 
     def run(self):
-        print(f"開始處理影片...")
-
+        # ... (保持不變) ...
+        print(f"開始執行穩定版測速... (FPS={self.fps})")
         while self.cap.isOpened():
             ret, frame = self.cap.read()
-            if not ret:
-                break
-
+            if not ret: break
             self.frame_count += 1
-
-            # 1. 影像處理
-            frame_bird, binary_clean = self._preprocess(frame)
-
-            # 2. 取得連通元件
-            ref_segments = self._get_segments(binary_clean)
-
-            # 3. 取得比例尺 (每幀重新計算，依照原始邏輯)
-            scale_m_per_pixel = self._calculate_scale_from_lines(binary_clean, frame_bird)
-
-            # 4. 計算速度
-            self._compute_speed(ref_segments, scale_m_per_pixel)
-
-            # 5. 繪製與輸出
-            self._draw_results(frame, frame_bird, ref_segments)
-
-            # 寫入影片檔
+            frame_bev, binary_clean = self._preprocess(frame)
+            current_lanes = self._get_lane_segments(binary_clean)
+            self._compute_speed_from_lanes(current_lanes)
+            vis_bev = self._draw_results(frame, frame_bev, current_lanes)
             self.out.write(frame)
-
-            binary_bgr = cv2.cvtColor(binary_clean, cv2.COLOR_GRAY2BGR)
-            binary_resized = cv2.resize(binary_bgr, (self.binary_width, self.binary_height))
-            self.out_binary.write(binary_resized)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-        # 釋放資源
+            self.out_binary.write(vis_bev)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
         self.cap.release()
         self.out.release()
         self.out_binary.release()
         cv2.destroyAllWindows()
-        print("處理完成。")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video", type=str, default="data/test1_mute.mp4")
+    parser.add_argument("--video", type=str, default="test1_mute.mp4")
+    parser.add_argument("--output", type=str, default="output/result_stable.mp4")
     args = parser.parse_args()
-
-    estimator = VehicleSpeedEstimator(video_path=args.video)
+    estimator = LaneLineSpeedEstimator(args.video, args.output)
     estimator.run()
